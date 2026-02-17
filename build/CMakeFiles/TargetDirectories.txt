@@ -1,0 +1,4 @@
+/home/ubuntu/Desktop/RefineWB/converters/build/CMakeFiles/of2gmf.dir
+/home/ubuntu/Desktop/RefineWB/converters/build/CMakeFiles/gmf2of.dir
+/home/ubuntu/Desktop/RefineWB/converters/build/CMakeFiles/edit_cache.dir
+/home/ubuntu/Desktop/RefineWB/converters/build/CMakeFiles/rebuild_cache.dir

@@ -1,0 +1,26 @@
+[
+{
+  "directory": "/home/ubuntu/Desktop/RefineWB/converters/build",
+  "command": "/bin/c++  -I/home/ubuntu/Desktop/RefineWB/converters/../libMeshb-7.80/sources -O3 -DNDEBUG -std=gnu++17 -o CMakeFiles/of2gmf.dir/of2gmf.cpp.o -c /home/ubuntu/Desktop/RefineWB/converters/of2gmf.cpp",
+  "file": "/home/ubuntu/Desktop/RefineWB/converters/of2gmf.cpp",
+  "output": "CMakeFiles/of2gmf.dir/of2gmf.cpp.o"
+},
+{
+  "directory": "/home/ubuntu/Desktop/RefineWB/converters/build",
+  "command": "/bin/cc  -I/home/ubuntu/Desktop/RefineWB/converters/../libMeshb-7.80/sources -O3 -DNDEBUG -o CMakeFiles/of2gmf.dir/home/ubuntu/Desktop/RefineWB/libMeshb-7.80/sources/libmeshb7.c.o -c /home/ubuntu/Desktop/RefineWB/libMeshb-7.80/sources/libmeshb7.c",
+  "file": "/home/ubuntu/Desktop/RefineWB/libMeshb-7.80/sources/libmeshb7.c",
+  "output": "CMakeFiles/of2gmf.dir/home/ubuntu/Desktop/RefineWB/libMeshb-7.80/sources/libmeshb7.c.o"
+},
+{
+  "directory": "/home/ubuntu/Desktop/RefineWB/converters/build",
+  "command": "/bin/c++  -I/home/ubuntu/Desktop/RefineWB/converters/../libMeshb-7.80/sources -O3 -DNDEBUG -std=gnu++17 -o CMakeFiles/gmf2of.dir/gmf2of.cpp.o -c /home/ubuntu/Desktop/RefineWB/converters/gmf2of.cpp",
+  "file": "/home/ubuntu/Desktop/RefineWB/converters/gmf2of.cpp",
+  "output": "CMakeFiles/gmf2of.dir/gmf2of.cpp.o"
+},
+{
+  "directory": "/home/ubuntu/Desktop/RefineWB/converters/build",
+  "command": "/bin/cc  -I/home/ubuntu/Desktop/RefineWB/converters/../libMeshb-7.80/sources -O3 -DNDEBUG -o CMakeFiles/gmf2of.dir/home/ubuntu/Desktop/RefineWB/libMeshb-7.80/sources/libmeshb7.c.o -c /home/ubuntu/Desktop/RefineWB/libMeshb-7.80/sources/libmeshb7.c",
+  "file": "/home/ubuntu/Desktop/RefineWB/libMeshb-7.80/sources/libmeshb7.c",
+  "output": "CMakeFiles/gmf2of.dir/home/ubuntu/Desktop/RefineWB/libMeshb-7.80/sources/libmeshb7.c.o"
+}
+]

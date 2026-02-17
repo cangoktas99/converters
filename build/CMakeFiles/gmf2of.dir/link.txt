@@ -1,0 +1,1 @@
+/bin/c++ -O3 -DNDEBUG CMakeFiles/gmf2of.dir/gmf2of.cpp.o "CMakeFiles/gmf2of.dir/home/ubuntu/Desktop/RefineWB/libMeshb-7.80/sources/libmeshb7.c.o" -o gmf2of  -lm 
