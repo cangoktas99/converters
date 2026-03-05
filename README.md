@@ -385,7 +385,7 @@ into its faces using fixed orientation templates:
 
 | Element | Face templates (0-based local node indices)                         |
 |---------|---------------------------------------------------------------------|
-| Tet     | `{0,1,2}` `{0,3,1}` `{1,3,2}` `{2,3,0}`                          |
+| Tet     | `{0,2,1}` `{0,1,3}` `{1,2,3}` `{0,3,2}`                          |
 | Hex     | `{0,3,2,1}` `{4,5,6,7}` `{0,1,5,4}` `{1,2,6,5}` `{2,3,7,6}` `{3,0,4,7}` |
 | Prism   | `{0,2,1}` `{3,4,5}` `{0,1,4,3}` `{1,2,5,4}` `{2,0,3,5}`         |
 | Pyramid | `{0,3,2,1}` `{0,1,4}` `{1,2,4}` `{2,3,4}` `{3,0,4}`             |
@@ -404,11 +404,21 @@ GMF boundary surface elements (`GmfTriangles`, `GmfQuadrilaterals`) carry a
 `ref` integer tag.  Each distinct ref value becomes one OpenFOAM boundary
 patch named `Patch_<ref>` with type `patch`.
 
-#### Solution output
+#### Solution input
+
+The converter reads the `.solb` and supports two layouts:
+
+1. **`SolAtElements`** (preferred) — `SolAtTetrahedra`, `SolAtHexahedra`,
+   `SolAtPrisms`, `SolAtPyramids`.  Values are mapped directly to OF cells.
+2. **`SolAtVertices`** (fallback) — vertex-centered data from external tools
+   (e.g. mesh adaptation).  Values are interpolated to cell centers by
+   averaging the vertex values of each cell.
+
+`SolAtElements` is checked first; `SolAtVertices` is used only when no
+per-element data is found.
 
 Each field file is written as a `nonuniform` list with `zeroGradient`
-boundary conditions on all patches.  The solution layout assumed when
-reading the `.solb` mirrors what `of2gmf` writes:
+boundary conditions on all patches.  The field mapping convention:
 - first scalar → `p`
 - second scalar → `T`
 - first vector → `U`

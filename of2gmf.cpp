@@ -27,6 +27,7 @@
 #include <sstream>
 #include <iostream>
 #include <stdexcept>
+#include <dirent.h>
 
 #include "libmeshb7.h"
 
@@ -45,6 +46,48 @@ static void skipFoamHeader(std::istream &in)
             return;
     }
     throw std::runtime_error("Malformed OpenFOAM file: separator not found");
+}
+
+/* Read the FoamFile header and return the value of the 'class' field.
+   Returns "" if the file cannot be opened or does not have a FoamFile header. */
+static std::string detectFoamClass(const std::string &path)
+{
+    std::ifstream in(path);
+    if (!in) return "";
+    std::string line;
+    bool inFoamFile = false;
+    while (std::getline(in, line)) {
+        if (line.find("FoamFile") != std::string::npos) { inFoamFile = true; continue; }
+        if (inFoamFile && line.find("class") != std::string::npos) {
+            std::istringstream ss(line);
+            std::string key, val;
+            ss >> key >> val;
+            if (!val.empty() && val.back() == ';') val.pop_back();
+            return val;
+        }
+        if (line.rfind("// *", 0) == 0) break;
+    }
+    return "";
+}
+
+/* Scan <fieldDir> for files whose FoamFile class is volScalarField or
+   volVectorField and return their names sorted alphabetically. */
+static std::vector<std::string> discoverFields(const std::string &fieldDir)
+{
+    std::vector<std::string> names;
+    DIR *dir = opendir(fieldDir.c_str());
+    if (!dir) return names;
+    struct dirent *ent;
+    while ((ent = readdir(dir)) != nullptr) {
+        std::string name = ent->d_name;
+        if (name == "." || name == ".." || name[0] == '.') continue;
+        std::string cls = detectFoamClass(fieldDir + "/" + name);
+        if (cls == "volScalarField" || cls == "volVectorField")
+            names.push_back(name);
+    }
+    closedir(dir);
+    std::sort(names.begin(), names.end());
+    return names;
 }
 
 /* Skip whitespace and comments ('//' to end-of-line) */
@@ -244,17 +287,21 @@ struct FieldData {
     std::vector<double> values; /* scalar: size nCells; vector: size nCells*3 */
 };
 
-static FieldData readField(const std::string &path, bool expectVector, int nCells)
+static FieldData readField(const std::string &path, int nCells)
 {
     FieldData fd;
-    fd.present   = false;
-    fd.isVector  = expectVector;
-    fd.nCells    = nCells;
+    fd.present  = false;
+    fd.nCells   = nCells;
+
+    std::string cls = detectFoamClass(path);
+    if (cls != "volScalarField" && cls != "volVectorField") return fd;
 
     std::ifstream in(path);
     if (!in) return fd; /* file not present */
 
-    fd.present = true;
+    bool expectVector = (cls == "volVectorField");
+    fd.present  = true;
+    fd.isVector = expectVector;
     skipFoamHeader(in);
 
     /* Scan for 'internalField' */
@@ -320,10 +367,15 @@ enum CellType { TET=0, HEX=1, PRISM=2, PYRAMID=3, POLY=4 };
 
 static const int N_NODES[] = {4, 8, 6, 5, 0};
 
-/* For a tet cell: extract 4 nodes in correct GMF orientation.
+/* For a tet cell: extract 4 nodes in INRIA GMF orientation.
+   INRIA convention: face (n0,n1,n2) viewed from n3 appears CCW,
+   i.e. the right-hand-rule normal of (n0,n1,n2) points TOWARD n3.
+
    face[f0] = base tri [a,b,c], apex = 4th vertex.
-   If the cell OWNS f0, the face normal (a->b->c CCW) points outward -> correct.
-   If the cell is NEIGHBOUR of f0, face is inverted -> flip b and c. */
+   If the cell OWNS f0, the OF face normal (a->b->c) points outward
+   (away from apex) -> flip b,c so normal points toward apex (INRIA).
+   If the cell is NEIGHBOUR of f0, the OF face normal already points
+   toward the cell (toward apex) -> keep as-is (already INRIA). */
 static void extractTet(const std::vector<std::vector<int>> &faces,
                        const std::vector<int> &owner,
                        const std::vector<int> &cellFaceList,
@@ -350,11 +402,11 @@ static void extractTet(const std::vector<std::vector<int>> &faces,
         if (v != a && v != b && v != c) { apex = v; break; }
 
     if (owner[f0] == cellId) {
-        /* f0 outward from this cell: normal a->b->c points away from apex */
-        out[0]=a+1; out[1]=b+1; out[2]=c+1; out[3]=apex+1;
-    } else {
-        /* f0 inward: flip */
+        /* f0 outward: normal (a->b->c) points away from apex; flip for INRIA */
         out[0]=a+1; out[1]=c+1; out[2]=b+1; out[3]=apex+1;
+    } else {
+        /* f0 inward: normal (a->b->c) points toward apex; already INRIA */
+        out[0]=a+1; out[1]=b+1; out[2]=c+1; out[3]=apex+1;
     }
 }
 
@@ -517,7 +569,11 @@ int main(int argc, char *argv[])
 {
     if (argc < 4) {
         std::fprintf(stderr,
-            "Usage: of2gmf <case_dir> <time_dir> <output_base>\n"
+            "Usage: of2gmf <case_dir> <time_dir> <output_base> [options] [field1 ...]\n"
+            "  --all       auto-discover all volScalarField/volVectorField files\n"
+            "  -b <ref.meshb>  copy boundary face refs from a reference .meshb\n"
+            "  field1 ...  explicit field names (e.g. k omega nut)\n"
+            "  (default: p T U)\n"
             "  Reads polyMesh + fields, writes <output_base>.meshb + .solb\n");
         return 1;
     }
@@ -528,6 +584,215 @@ int main(int argc, char *argv[])
 
     std::string meshDir  = caseDir + "/constant/polyMesh";
     std::string fieldDir = caseDir + "/" + timeDir;
+
+    /* ---- Parse optional arguments ---- */
+    std::vector<std::string> fieldNames;
+    std::string refMeshFile;
+    bool doAll = false;
+    for (int i = 4; i < argc; i++) {
+        std::string arg = argv[i];
+        if (arg == "--all") {
+            doAll = true;
+        } else if (arg == "-b" && i + 1 < argc) {
+            refMeshFile = argv[++i];
+        } else {
+            fieldNames.push_back(arg);
+        }
+    }
+    if (doAll) fieldNames = discoverFields(fieldDir);
+    if (fieldNames.empty()) fieldNames = {"p", "T", "U"};
+
+    /* ---- Load reference geometry data if provided ---- */
+    /* Coordinate-based key for matching vertices across meshes */
+    struct CoordKey {
+        int64_t ix, iy, iz;
+        bool operator<(const CoordKey &o) const {
+            if (ix != o.ix) return ix < o.ix;
+            if (iy != o.iy) return iy < o.iy;
+            return iz < o.iz;
+        }
+    };
+    /* Quantise coordinates for matching.
+       Use 1e6 resolution (~1 micron at meter scale) to tolerate the
+       ASCII precision loss when coordinates pass through OpenFOAM text
+       format.  This is safe since mesh vertices are always well-separated
+       relative to this tolerance. */
+    auto makeCoordKey = [](double x, double y, double z) -> CoordKey {
+        const double S = 1e6;
+        return { (int64_t)std::llround(x*S),
+                 (int64_t)std::llround(y*S),
+                 (int64_t)std::llround(z*S) };
+    };
+
+    using FaceKey = std::vector<int>;
+    auto makeFaceKey = [](const std::vector<int> &verts) -> FaceKey {
+        FaceKey k = verts;
+        std::sort(k.begin(), k.end());
+        return k;
+    };
+    using EdgeKey = std::pair<int,int>;
+    auto makeEdgeKey = [](int a, int b) -> EdgeKey {
+        return a < b ? EdgeKey{a,b} : EdgeKey{b,a};
+    };
+
+    /* Data from reference mesh */
+    std::map<FaceKey, int> refBndFaceRef;  /* sorted 1-based verts → ref */
+    struct RefEdge { int v0, v1, ref; };   /* 1-based ref-mesh vertex IDs */
+    std::vector<RefEdge> refEdges;
+    std::vector<int> refCorners;           /* 1-based ref-mesh vertex IDs */
+    std::vector<int> refRidges;            /* 1-based ref-mesh edge indices (into refEdges) */
+    /* Geometry associations: VerticesOnGeometric{Vertices,Edges,Triangles} */
+    struct GeomNode { int node, id; };                   /* kw 40 */
+    struct GeomEdge { int node, id; double t, gref; };   /* kw 41 */
+    struct GeomFace { int node, id; double u, v, gref; };/* kw 42 */
+    std::vector<GeomNode> refGeomNodes;
+    std::vector<GeomEdge> refGeomEdges;
+    std::vector<GeomFace> refGeomFaces;
+    /* cad_data (GmfByteFlow) */
+    std::vector<unsigned char> refCadData;
+    /* Coordinate map: ref-mesh vertex → CoordKey */
+    std::map<CoordKey, int> refCoordToIdx; /* coord → 1-based ref vertex */
+    std::vector<std::array<double,3>> refPts; /* ref vertex coords (0-based) */
+    std::vector<int> refVertexRefs;              /* ref vertex refs (0-based) */
+
+    if (!refMeshFile.empty()) {
+        int rver, rdim;
+        int64_t rmsh = GmfOpenMesh(refMeshFile.c_str(), GmfRead, &rver, &rdim);
+        if (!rmsh) {
+            std::fprintf(stderr, "Warning: cannot open ref mesh %s, ignoring -b\n",
+                         refMeshFile.c_str());
+            refMeshFile.clear();
+        } else {
+            std::printf("Reading geometry data from %s ...\n", refMeshFile.c_str());
+
+            /* Read reference vertices (for coordinate matching) */
+            int64_t nRefVerts = GmfStatKwd(rmsh, GmfVertices);
+            if (nRefVerts > 0) {
+                refPts.resize(nRefVerts);
+                refVertexRefs.resize(nRefVerts);
+                GmfGotoKwd(rmsh, GmfVertices);
+                for (int64_t i = 0; i < nRefVerts; i++) {
+                    GmfGetLin(rmsh, GmfVertices,
+                              &refPts[i][0], &refPts[i][1], &refPts[i][2],
+                              &refVertexRefs[i]);
+                    CoordKey ck = makeCoordKey(refPts[i][0], refPts[i][1], refPts[i][2]);
+                    refCoordToIdx[ck] = (int)(i + 1); /* 1-based */
+                }
+                std::printf("  Read %lld reference vertices\n", (long long)nRefVerts);
+            }
+
+            /* Read boundary face refs (triangles + quads) */
+            auto readRefBnd = [&](int kwd, int nv) {
+                int64_t n = GmfStatKwd(rmsh, kwd);
+                if (n == 0) return;
+                GmfGotoKwd(rmsh, kwd);
+                for (int64_t i = 0; i < n; i++) {
+                    int nd[4], ref;
+                    if (nv == 3)
+                        GmfGetLin(rmsh, kwd, &nd[0],&nd[1],&nd[2],&ref);
+                    else
+                        GmfGetLin(rmsh, kwd, &nd[0],&nd[1],&nd[2],&nd[3],&ref);
+                    std::vector<int> verts(nd, nd + nv);
+                    std::sort(verts.begin(), verts.end());
+                    refBndFaceRef[verts] = ref;
+                }
+                std::printf("  Read %lld %s from reference mesh\n",
+                            (long long)n, nv == 3 ? "triangles" : "quads");
+            };
+            readRefBnd(GmfTriangles, 3);
+            readRefBnd(GmfQuadrilaterals, 4);
+
+            /* Read boundary edges */
+            {
+                int64_t n = GmfStatKwd(rmsh, GmfEdges);
+                if (n > 0) {
+                    GmfGotoKwd(rmsh, GmfEdges);
+                    refEdges.resize(n);
+                    for (int64_t i = 0; i < n; i++) {
+                        GmfGetLin(rmsh, GmfEdges,
+                                  &refEdges[i].v0, &refEdges[i].v1, &refEdges[i].ref);
+                    }
+                    std::printf("  Read %lld edges from reference mesh\n", (long long)n);
+                }
+            }
+
+            /* Read corners */
+            {
+                int64_t n = GmfStatKwd(rmsh, GmfCorners);
+                if (n > 0) {
+                    GmfGotoKwd(rmsh, GmfCorners);
+                    refCorners.resize(n);
+                    for (int64_t i = 0; i < n; i++)
+                        GmfGetLin(rmsh, GmfCorners, &refCorners[i]);
+                    std::printf("  Read %lld corners from reference mesh\n", (long long)n);
+                }
+            }
+
+            /* Read ridges */
+            {
+                int64_t n = GmfStatKwd(rmsh, GmfRidges);
+                if (n > 0) {
+                    GmfGotoKwd(rmsh, GmfRidges);
+                    refRidges.resize(n);
+                    for (int64_t i = 0; i < n; i++)
+                        GmfGetLin(rmsh, GmfRidges, &refRidges[i]);
+                    std::printf("  Read %lld ridges from reference mesh\n", (long long)n);
+                }
+            }
+
+            /* Read geometry associations (VerticesOnGeometric*) */
+            {
+                int64_t n = GmfStatKwd(rmsh, GmfVerticesOnGeometricVertices);
+                if (n > 0) {
+                    refGeomNodes.resize(n);
+                    GmfGotoKwd(rmsh, GmfVerticesOnGeometricVertices);
+                    for (int64_t i = 0; i < n; i++)
+                        GmfGetLin(rmsh, GmfVerticesOnGeometricVertices,
+                                  &refGeomNodes[i].node, &refGeomNodes[i].id);
+                    std::printf("  Read %lld VerticesOnGeometricVertices\n", (long long)n);
+                }
+            }
+            {
+                int64_t n = GmfStatKwd(rmsh, GmfVerticesOnGeometricEdges);
+                if (n > 0) {
+                    refGeomEdges.resize(n);
+                    GmfGotoKwd(rmsh, GmfVerticesOnGeometricEdges);
+                    for (int64_t i = 0; i < n; i++)
+                        GmfGetLin(rmsh, GmfVerticesOnGeometricEdges,
+                                  &refGeomEdges[i].node, &refGeomEdges[i].id,
+                                  &refGeomEdges[i].t, &refGeomEdges[i].gref);
+                    std::printf("  Read %lld VerticesOnGeometricEdges\n", (long long)n);
+                }
+            }
+            {
+                int64_t n = GmfStatKwd(rmsh, GmfVerticesOnGeometricTriangles);
+                if (n > 0) {
+                    refGeomFaces.resize(n);
+                    GmfGotoKwd(rmsh, GmfVerticesOnGeometricTriangles);
+                    for (int64_t i = 0; i < n; i++)
+                        GmfGetLin(rmsh, GmfVerticesOnGeometricTriangles,
+                                  &refGeomFaces[i].node, &refGeomFaces[i].id,
+                                  &refGeomFaces[i].u, &refGeomFaces[i].v,
+                                  &refGeomFaces[i].gref);
+                    std::printf("  Read %lld VerticesOnGeometricTriangles\n", (long long)n);
+                }
+            }
+
+            /* Read cad_data using dedicated helper (before closing) */
+            {
+                int nmbByt = 0;
+                char *buf = GmfReadByteFlow(rmsh, &nmbByt);
+                if (buf && nmbByt > 0) {
+                    refCadData.assign(buf, buf + nmbByt);
+                    free(buf);
+                    std::printf("  Read %d bytes of cad_data from reference mesh\n",
+                                nmbByt);
+                }
+            }
+
+            GmfCloseMesh(rmsh);
+        }
+    }
 
     /* ---- Read polyMesh ---- */
     std::printf("Reading %s ...\n", meshDir.c_str());
@@ -623,24 +888,44 @@ int main(int argc, char *argv[])
     /* ---- Collect boundary faces ---- */
     struct BndFace {
         std::vector<int> verts; /* 1-based */
-        int ref;                /* patch index (1-based) */
+        int ref;                /* patch index or EGADS face ID */
     };
     std::vector<BndFace> bndTri, bndQad;
+    int nRefMatched = 0, nRefFallback = 0;
 
     for (int pi = 0; pi < (int)patches.size(); pi++) {
         const Patch &p = patches[pi];
-        int ref = pi + 1; /* 1-based patch index */
+        int patchRef = pi + 1; /* fallback: 1-based patch index */
         for (int fi = p.startFace; fi < p.startFace + p.nFaces; fi++) {
             const auto &fv = faces[fi];
             BndFace bf;
-            bf.ref = ref;
             /* OF stores boundary face CCW from owner (outward), keep as-is */
             bf.verts.reserve(fv.size());
             for (int v : fv) bf.verts.push_back(v + 1); /* 0→1-based */
+
+            /* Try to recover original ref from reference mesh */
+            if (!refBndFaceRef.empty()) {
+                FaceKey key = makeFaceKey(bf.verts);
+                auto it = refBndFaceRef.find(key);
+                if (it != refBndFaceRef.end()) {
+                    bf.ref = it->second;
+                    nRefMatched++;
+                } else {
+                    bf.ref = patchRef;
+                    nRefFallback++;
+                }
+            } else {
+                bf.ref = patchRef;
+            }
+
             if ((int)fv.size() == 3) bndTri.push_back(bf);
             else if ((int)fv.size() == 4) bndQad.push_back(bf);
             /* larger polygon faces: skip */
         }
+    }
+    if (!refBndFaceRef.empty()) {
+        std::printf("  Boundary refs: %d matched from reference, %d fallback\n",
+                    nRefMatched, nRefFallback);
     }
 
     /* ---- Write .meshb ---- */
@@ -653,10 +938,47 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    /* Vertices */
+    /* Vertices — use refs from reference mesh if available.
+       Build ref-vertex → output-vertex mapping for geometry data. */
+    std::vector<int> vertexRef(nPoints, 0);
+    /* ref2outVert[r] = 1-based output vertex index for ref vertex r (1-based) */
+    std::vector<int> ref2outVert;
+    if (!refMeshFile.empty() && !refPts.empty()) {
+        ref2outVert.resize((int)refPts.size() + 1, 0);
+
+        /* If vertex counts match, assume direct 1:1 correspondence
+           (gmf2of preserves vertex order, createPatch preserves indices) */
+        if ((int)refPts.size() == nPoints) {
+            std::printf("  Vertex counts match (%d) — using direct index mapping\n",
+                        nPoints);
+            for (int i = 0; i < nPoints; i++) {
+                ref2outVert[i + 1] = i + 1;
+                vertexRef[i] = refVertexRefs[i];
+            }
+        } else {
+            /* Fall back to coordinate matching */
+            std::map<CoordKey, int> coordToRef;
+            for (int i = 0; i < (int)refPts.size(); i++)
+                coordToRef[makeCoordKey(refPts[i][0], refPts[i][1], refPts[i][2])]
+                    = i + 1;
+            int nMatched = 0;
+            for (int i = 0; i < nPoints; i++) {
+                auto it = coordToRef.find(
+                    makeCoordKey(pts[i][0], pts[i][1], pts[i][2]));
+                if (it != coordToRef.end()) {
+                    int refIdx = it->second;
+                    ref2outVert[refIdx] = i + 1;
+                    vertexRef[i] = refVertexRefs[refIdx - 1];
+                    nMatched++;
+                }
+            }
+            std::printf("  Vertex refs: %d / %d matched by coordinate\n",
+                        nMatched, nPoints);
+        }
+    }
     GmfSetKwd(msh, GmfVertices, nPoints);
     for (int i = 0; i < nPoints; i++)
-        GmfSetLin(msh, GmfVertices, pts[i][0], pts[i][1], pts[i][2], 0);
+        GmfSetLin(msh, GmfVertices, pts[i][0], pts[i][1], pts[i][2], vertexRef[i]);
 
     /* Volume elements */
     if (!tets.empty()) {
@@ -701,6 +1023,136 @@ int main(int argc, char *argv[])
                       bf.verts[0], bf.verts[1], bf.verts[2], bf.verts[3], bf.ref);
     }
 
+    /* ---- Write geometry data from reference mesh ---- */
+    if (!refMeshFile.empty() && !ref2outVert.empty()) {
+        auto &ref2out = ref2outVert; /* alias for brevity */
+
+        /* Write GmfEdges */
+        if (!refEdges.empty()) {
+            /* Map edges and filter out unmapped ones */
+            struct OutEdge { int v0, v1, ref; };
+            std::vector<OutEdge> outEdges;
+            for (auto &re : refEdges) {
+                int ov0 = ref2out[re.v0], ov1 = ref2out[re.v1];
+                if (ov0 > 0 && ov1 > 0)
+                    outEdges.push_back({ov0, ov1, re.ref});
+            }
+            if (!outEdges.empty()) {
+                GmfSetKwd(msh, GmfEdges, (int64_t)outEdges.size());
+                for (auto &e : outEdges)
+                    GmfSetLin(msh, GmfEdges, e.v0, e.v1, e.ref);
+                std::printf("  Wrote %zu boundary edges\n", outEdges.size());
+            }
+
+            /* Write GmfRidges (ridge = edge index; remap to new edge list) */
+            if (!refRidges.empty()) {
+                /* Build ref-edge-index → out-edge-index map */
+                /* refRidges[i] is 1-based index into the original edge list */
+                /* We need to find which output edge corresponds to each ref edge */
+                std::map<EdgeKey, int> outEdgeIdx; /* sorted pair → 1-based out index */
+                for (int i = 0; i < (int)outEdges.size(); i++)
+                    outEdgeIdx[makeEdgeKey(outEdges[i].v0, outEdges[i].v1)] = i + 1;
+
+                std::vector<int> outRidges;
+                for (int ri : refRidges) {
+                    if (ri < 1 || ri > (int)refEdges.size()) continue;
+                    int rv0 = ref2out[refEdges[ri-1].v0];
+                    int rv1 = ref2out[refEdges[ri-1].v1];
+                    if (rv0 > 0 && rv1 > 0) {
+                        auto it = outEdgeIdx.find(makeEdgeKey(rv0, rv1));
+                        if (it != outEdgeIdx.end())
+                            outRidges.push_back(it->second);
+                    }
+                }
+                if (!outRidges.empty()) {
+                    GmfSetKwd(msh, GmfRidges, (int64_t)outRidges.size());
+                    for (int r : outRidges)
+                        GmfSetLin(msh, GmfRidges, r);
+                    std::printf("  Wrote %zu ridges\n", outRidges.size());
+                }
+            }
+        }
+
+        /* Write GmfCorners */
+        if (!refCorners.empty()) {
+            std::vector<int> outCorners;
+            for (int rc : refCorners) {
+                int ov = ref2out[rc];
+                if (ov > 0) outCorners.push_back(ov);
+            }
+            if (!outCorners.empty()) {
+                GmfSetKwd(msh, GmfCorners, (int64_t)outCorners.size());
+                for (int c : outCorners)
+                    GmfSetLin(msh, GmfCorners, c);
+                std::printf("  Wrote %zu corners\n", outCorners.size());
+            }
+        }
+    }
+
+    /* ---- Write geometry associations from reference mesh ---- */
+    if (!refMeshFile.empty() && !ref2outVert.empty()) {
+        auto mapRefVert = [&](int refVert) -> int {
+            if (refVert < 1 || refVert >= (int)ref2outVert.size()) return 0;
+            return ref2outVert[refVert];
+        };
+
+        /* VerticesOnGeometricVertices */
+        if (!refGeomNodes.empty()) {
+            std::vector<GeomNode> out;
+            for (auto &g : refGeomNodes) {
+                int ov = mapRefVert(g.node);
+                if (ov > 0) out.push_back({ov, g.id});
+            }
+            if (!out.empty()) {
+                GmfSetKwd(msh, GmfVerticesOnGeometricVertices, (int64_t)out.size());
+                for (auto &g : out)
+                    GmfSetLin(msh, GmfVerticesOnGeometricVertices, g.node, g.id);
+                std::printf("  Wrote %zu VerticesOnGeometricVertices\n", out.size());
+            }
+        }
+        /* VerticesOnGeometricEdges */
+        if (!refGeomEdges.empty()) {
+            std::vector<GeomEdge> out;
+            for (auto &g : refGeomEdges) {
+                int ov = mapRefVert(g.node);
+                if (ov > 0) out.push_back({ov, g.id, g.t, g.gref});
+            }
+            if (!out.empty()) {
+                GmfSetKwd(msh, GmfVerticesOnGeometricEdges, (int64_t)out.size());
+                for (auto &g : out)
+                    GmfSetLin(msh, GmfVerticesOnGeometricEdges,
+                              g.node, g.id, g.t, g.gref);
+                std::printf("  Wrote %zu VerticesOnGeometricEdges\n", out.size());
+            }
+        }
+        /* VerticesOnGeometricTriangles */
+        if (!refGeomFaces.empty()) {
+            std::vector<GeomFace> out;
+            for (auto &g : refGeomFaces) {
+                int ov = mapRefVert(g.node);
+                if (ov > 0) out.push_back({ov, g.id, g.u, g.v, g.gref});
+            }
+            if (!out.empty()) {
+                GmfSetKwd(msh, GmfVerticesOnGeometricTriangles, (int64_t)out.size());
+                for (auto &g : out)
+                    GmfSetLin(msh, GmfVerticesOnGeometricTriangles,
+                              g.node, g.id, g.u, g.v, g.gref);
+                std::printf("  Wrote %zu VerticesOnGeometricTriangles\n", out.size());
+            }
+        }
+    }
+
+    /* Write cad_data (GmfByteFlow) before closing the mesh.
+       Note: cad_data embedding is optional — refine can load the .egads
+       file directly via the -g flag instead. */
+    if (0 && !refCadData.empty()) {
+        if (GmfWriteByteFlow(msh, (char *)refCadData.data(),
+                             (int)refCadData.size()))
+            std::printf("  Wrote %zu bytes of cad_data\n", refCadData.size());
+        else
+            std::fprintf(stderr, "  Warning: failed to write cad_data\n");
+    }
+
     GmfCloseMesh(msh);
     std::printf("  Wrote %d vertices, %zu tets, %zu hexes, %zu prisms, %zu pyramids\n",
                 nPoints, tets.size(), hexes.size(), prisms.size(), pyramids.size());
@@ -708,12 +1160,20 @@ int main(int argc, char *argv[])
                 bndTri.size(), bndQad.size());
 
     /* ---- Read solution fields ---- */
-    auto fp   = readField(fieldDir + "/p", false, nCells);
-    auto fT   = readField(fieldDir + "/T", false, nCells);
-    auto fU   = readField(fieldDir + "/U", true,  nCells);
+    std::vector<FieldData> fields;
+    for (auto &name : fieldNames) {
+        auto fd = readField(fieldDir + "/" + name, nCells);
+        if (fd.present) {
+            std::printf("  Field '%s' (%s)\n", name.c_str(),
+                        fd.isVector ? "vector" : "scalar");
+            fields.push_back(fd);
+        } else {
+            std::fprintf(stderr, "Warning: field '%s' not found or not a vol field, skipping\n",
+                         name.c_str());
+        }
+    }
 
-    bool hasSol = fp.present || fT.present || fU.present;
-    if (!hasSol) {
+    if (fields.empty()) {
         std::printf("No solution fields found in %s, skipping .solb\n",
                     fieldDir.c_str());
         return 0;
@@ -721,9 +1181,8 @@ int main(int argc, char *argv[])
 
     /* Build solution type descriptor */
     std::vector<int> solTypVec;
-    if (fp.present) solTypVec.push_back(GmfSca);
-    if (fT.present) solTypVec.push_back(GmfSca);
-    if (fU.present) solTypVec.push_back(GmfVec);
+    for (auto &fd : fields)
+        solTypVec.push_back(fd.isVector ? GmfVec : GmfSca);
     int nSolTyp = (int)solTypVec.size();
 
     /* Compute total doubles per cell */
@@ -734,15 +1193,16 @@ int main(int argc, char *argv[])
     /* Build flat per-cell solution array (indexed by OF cell ID) */
     std::vector<double> solAll(nCells * solSiz, 0.0);
     for (int c = 0; c < nCells; c++) {
-        int off = c * solSiz;
-        int pos = 0;
-        if (fp.present) { solAll[off + pos] = fp.values[c]; pos++; }
-        if (fT.present) { solAll[off + pos] = fT.values[c]; pos++; }
-        if (fU.present) {
-            solAll[off + pos+0] = fU.values[c*3+0];
-            solAll[off + pos+1] = fU.values[c*3+1];
-            solAll[off + pos+2] = fU.values[c*3+2];
-            pos += 3;
+        int off = c * solSiz, pos = 0;
+        for (auto &fd : fields) {
+            if (!fd.isVector) {
+                solAll[off + pos++] = fd.values[c];
+            } else {
+                solAll[off + pos+0] = fd.values[c*3+0];
+                solAll[off + pos+1] = fd.values[c*3+1];
+                solAll[off + pos+2] = fd.values[c*3+2];
+                pos += 3;
+            }
         }
     }
 
@@ -795,8 +1255,56 @@ int main(int argc, char *argv[])
     writeSolKwd(sol, GmfSolAtPrisms,        priSol, (int64_t)prisms.size());
     writeSolKwd(sol, GmfSolAtPyramids,      pyrSol, (int64_t)pyramids.size());
 
+    /* ---- Interpolate cell-centered solution to vertices ---- */
+    std::vector<double> vertSol(nPoints * solSiz, 0.0);
+    std::vector<int> vertCount(nPoints, 0);
+
+    auto addCellToVerts = [&](const std::vector<ElemRecord> &elems,
+                              int nNodes, int cellOff) {
+        for (int i = 0; i < (int)elems.size(); i++) {
+            int ci = cellOff + i;
+            for (int k = 0; k < nNodes; k++) {
+                int vi = elems[i].nodes[k] - 1; /* 1-based → 0-based */
+                for (int s = 0; s < solSiz; s++)
+                    vertSol[vi * solSiz + s] += solAll[ci * solSiz + s];
+                vertCount[vi]++;
+            }
+        }
+    };
+
+    int tetOff = 0;
+    int hexOff = (int)tets.size();
+    int priOff = hexOff + (int)hexes.size();
+    int pyrOff = priOff + (int)prisms.size();
+    addCellToVerts(tets,     4, tetOff);
+    addCellToVerts(hexes,    8, hexOff);
+    addCellToVerts(prisms,   6, priOff);
+    addCellToVerts(pyramids, 5, pyrOff);
+
+    for (int v = 0; v < nPoints; v++) {
+        if (vertCount[v] > 0) {
+            for (int s = 0; s < solSiz; s++)
+                vertSol[v * solSiz + s] /= vertCount[v];
+        }
+    }
+
+    GmfSetKwd(sol, GmfSolAtVertices, (int64_t)nPoints, nSolTyp, solTypArr);
+    for (int64_t i = 0; i < nPoints; i++)
+        GmfSetLin(sol, GmfSolAtVertices, &vertSol[i * solSiz]);
+
+    /* ---- Write field names via ReferenceStrings ---- */
+    GmfSetKwd(sol, GmfReferenceStrings, (int64_t)fieldNames.size());
+    for (int f = 0; f < (int)fieldNames.size(); f++) {
+        char nameBuf[256] = {};
+        std::snprintf(nameBuf, sizeof(nameBuf), "%s %d",
+                      fieldNames[f].c_str(), f + 1);
+        GmfSetLin(sol, GmfReferenceStrings,
+                  GmfSolAtVertices, 1, nameBuf);
+    }
+
     GmfCloseMesh(sol);
     std::printf("  Solution: %d field(s), %d doubles/cell\n", nSolTyp, solSiz);
+    std::printf("  SolAtVertices: %d vertices (cell-averaged)\n", nPoints);
     std::printf("Done.\n");
     return 0;
 }
