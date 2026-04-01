@@ -353,10 +353,14 @@ readPatchBCs(const std::string &path)
         }
 
         /* Track braces */
+        int prevDepth = depth;
         for (char c : t) {
             if (c == '{') depth++;
             if (c == '}') depth--;
         }
+
+        /* Skip the opening brace of a patch entry (depth 0→1 transition) */
+        if (prevDepth == 0 && depth == 1) continue;
 
         if (depth == 0 && t.find('}') != std::string::npos) {
             /* Closing brace of current patch */
